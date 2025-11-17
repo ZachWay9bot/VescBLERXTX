@@ -61,6 +61,5 @@ Battery %, Wh, fault code, controller ID, etc.
 
 Raw notify callback for debugging/logging
 
-✅ Example: SimpleDemo (Serial)
 
-✅ Example: GT911 Touch Slider UI using TFT_eSPI + GT911 (via bb_captouch)
+use it at your own risk!
