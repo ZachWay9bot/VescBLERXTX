@@ -1,11 +1,10 @@
-\
+
 #include "vescblerxtx.h"
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEClient.h>
 #include <BLERemoteCharacteristic.h>
-#include <math.h>
 
 VescBleRxTx* VescBleRxTx::_active = nullptr;
 static bool s_bleInit = false;
@@ -159,7 +158,7 @@ void VescBleRxTx::loop(){
         uint8_t((be >>  8) & 0xFF),
         uint8_t( be        & 0xFF)
       };
-      rx->writeValue(b, 4, false);
+      rx->writeValue(b, 4, false); // WWR
     }
     _lastSendMs = now;
   }
@@ -209,25 +208,6 @@ void VescBleRxTx::_parseTelemetryLine(const char* line, size_t len){
           else if (key=="amot"||key=="avgmotorcurrent") t.avgMotorCurrent = v;
           else if (key=="tmos"||key=="tempmosfet")      t.tempMosfet = v;
           else if (key=="tmot"||key=="tempmotor")       t.tempMotor = v;
-          else if (key=="cur_in"||key=="inputcurrent")  t.current_in = v;
-          else if (key=="cur_mot"||key=="motorcurrent") t.current_motor = v;
-          else if (key=="wh"||key=="watthours")         t.watt_hours = v;
-          else if (key=="wh_chg"||key=="charged")       t.watt_hours_charged = v;
-          else if (key=="ah"||key=="amphours")          t.amp_hours = v;
-          else if (key=="ah_chg"||key=="amphourscharged") t.amp_hours_charged = v;
-          else if (key=="speed"||key=="kmh")            t.speed_kmh = v;
-          else if (key=="pos"||key=="position")         t.position = v;
-          else if (key=="tacho"||key=="tachometer")     t.tachometer = (int32_t)v;
-          else if (key=="tacho_abs")                    t.tachometer_abs = (int32_t)v;
-          else if (key=="tmp1"||key=="tempmos1")        t.temp_mos_1 = v;
-          else if (key=="tmp2"||key=="tempmos2")        t.temp_mos_2 = v;
-          else if (key=="tmp3"||key=="tempmos3")        t.temp_mos_3 = v;
-          else if (key=="tmp_pcb"||key=="temppcb")      t.temp_pcb = v;
-          else if (key=="batt"||key=="battery")         t.battery_level = v;
-          else if (key=="batt_wh"||key=="batterywh")    t.battery_wh = v;
-          else if (key=="fault"||key=="faultcode")      t.fault_code = (uint8_t)v;
-          else if (key=="ctrl_id"||key=="controllerid") t.controller_id = (uint8_t)v;
-          else if (key=="pid_pos"||key=="pidposition")  t.pid_pos = v;
         }
         token = String();
       }
