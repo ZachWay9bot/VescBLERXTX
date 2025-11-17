@@ -1,82 +1,66 @@
-vescblerxtx
+# vescblerxtx
 
-Kleine, knackige ESP32-Arduino-Lib für VESC-Steuerung per BLE (Nordic-UART/NUS) – optional mit Telemetrie. Fokus: niedrige Latenz, simple API, sauberer Sollwert-Pfad (Current, Brake, Duty, RPM) mit eingebauter Safety.
+**vescblerxtx** is a small Arduino C++ library for controlling a VESC (or compatible ESC) over BLE using a simple **int32 big-endian ×1000 command stream** and receiving **ASCII telemetry** (`key=value` lines).
 
-Zielplattform: ESP32 / ESP32-C3 / ESP32-C6 (Arduino Core ≥ 2.0)
-Transport: BLE (NUS-Service als Standard)
-Payload: int32 Big-Endian, Skala ×1000 (v1.0.4)
-Modi: CURRENT, BRAKE, DUTY, RPM (umschaltbar)
-Safety: Deadband, Slew-Limiter, IIR-Glättung, Idle-Timeout → sendet 0
+It is designed as the BLE “transport core” for things like:
 
-features
+- Touch throttles
+- DIY dashboards
+- Scooter bridge projects
+- Remote controls and test rigs
 
-Connect per MAC oder Name (NUS-UUIDs vordefiniert, bei Bedarf überladbar)
+The library does **not** parse the raw VESC binary protocol directly.  
+Instead, it expects a BLE target that:
 
-Periodisches Senden im festen Raster (Default 50 ms)
+1. Exposes a Nordic UART Service (NUS) or compatible RX/TX characteristics.
+2. Interprets incoming 4-byte big-endian `int32` values as a control command.
+3. Sends human-readable telemetry lines like:
 
-Eingangsfilter: IIR, Slew-Limit, Deadband
+   ```text
+   volt=50.3,erpm=12345,duty=0.13,ain=1.2,amot=3.4,kmh=25.0,batt=82,...
+The library then:
 
-Failsafe: nach IDLE_ZERO_MS ohne Updates → Befehl = 0
+Handles BLE connect / reconnect / notify.
 
-Optional: Telemetrie-Callback (Volt, ERPM, Duty, Ströme, Temperaturen), falls die Gegenseite sendet
+Applies deadband, IIR filtering, slew rate limiting, idle-zero safety.
 
-installation
+Parses telemetry into a rich VescTelemetry struct.
 
-Ordner vescblerxtx/ nach ~/Documents/Arduino/libraries/ kopieren
-(enthält src/vescblerxtx.h, src/vescblerxtx.cpp, library.properties …)
+Features
+ 
+ BLE client for Nordic UART Service (NUS)
+ 
+ Connect by device name or MAC address
 
-Arduino IDE neu starten.
+ Command modes: CURRENT, BRAKE, DUTY, RPM
 
-Abhängigkeit: ESP32 BLE Arduino oder NimBLE-Arduino (je nach Implementierung der Lib).
-Hinweis: Bei NimBLE keine zweite BLE-Lib parallel aktiv halten.
+ Simple command encoding: float → int32 BE × 1000
 
-quickstart
-#include <Arduino.h>
-#include <vescblerxtx.h>
 
-VescBleRxTx vesc;
+Built-in filters:
 
-void setup() {
-  Serial.begin(115200);
+Deadband
 
-  // optional: Telemetrie anhängen
-  vesc.onTelemetry([](const VescTelemetry& t){
-    // Serial.printf("V:%.2f  ERPM:%.0f  Duty:%.3f\n", t.voltage, t.erpm, t.duty);
-  });
+IIR low-pass
 
-  vesc.begin();                        // NUS-UUIDs sind Default
-  vesc.connectByName("VESC_BLE");      // oder: vesc.connectByMac("AA:BB:CC:DD:EE:FF");
+Slew rate limiter
 
-  vesc.setControlMode(VESC_MODE_CURRENT); // CURRENT / DUTY / RPM
-  vesc.setSendIntervalMs(50);             // periodischer Output
-  vesc.setIdleZeroMs(150);                // Failsafe-Fenster
-  vesc.setIirAlpha(0.20f);                // 0..1 (höher = weniger Glättung)
-  vesc.setSlewAperSec(4.0f);              // A/s bei CURRENT
-  vesc.setDeadbandPct(0.06f);             // neutraler Bereich um 0
-}
+Idle zero timeout
 
-void loop() {
-  vesc.loop(); // BLE-Housekeeping + Timing für periodisches Senden
+Telemetry callback with a packed struct:
 
-  // Beispiel: 1.2 A Sollstrom (abhängig vom Modus)
-  if (vesc.isConnected()) {
-    vesc.setCommand(1.2f);
-  }
-  delay(10);
-}
+Voltage, ERPM, duty
 
-kompatibilität
+Currents, power/energy (Ah/Wh)
 
-Getestet: ESP32, ESP32-C3, ESP32-C6 Devkits / „Super Mini“
+Temperatures (MOSFET, motor, extended)
 
-UART parallel nutzbar (BLE ist unabhängig)
+Speed, tacho, position
 
-NUS-Service: 6E4000xx-… (siehe PROTOCOL.md), bei Bedarf via begin(...) übersteuerbar
+Battery %, Wh, fault code, controller ID, etc.
 
-sicherheit & haftung
+Raw notify callback for debugging/logging
 
-Sinnvolle Limits setzen: Max-Strom, Max-Brake, Duty-Cap, RPM-Cap.
+✅ Example: SimpleDemo (Serial)
 
-Im VESC zusätzlich Undervoltage/Speed-Caps aktivieren.
-
-Erst ohne Last testen. Nutzung auf eigenes Risiko.
+✅ Example: GT911 Touch Slider UI using TFT_eSPI + GT911 (via bb_captouch)
