@@ -1,85 +1,243 @@
+\
 #include "vescblerxtx.h"
-#include <string.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEClient.h>
+#include <BLERemoteCharacteristic.h>
 #include <math.h>
 
-namespace vescblerxtx {
+VescBleRxTx* VescBleRxTx::_active = nullptr;
+static bool s_bleInit = false;
 
-  static WriteFn s_writer = nullptr;
+template<typename T> static inline T clampv(T x, T lo, T hi){ return x<lo?lo:(x>hi?hi:x); }
 
-  static uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
-    uint16_t crc = 0;
-    for (size_t i = 0; i < len; ++i) {
-      crc ^= (uint16_t)data[i] << 8;
-      for (int j = 0; j < 8; j++) {
-        if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
-        else              crc = (crc << 1);
-      }
+class VescBleRxTx::_ClientCB : public BLEClientCallbacks {
+  void onConnect(BLEClient* c) override {}
+  void onDisconnect(BLEClient* c) override {
+    if (VescBleRxTx::_active) VescBleRxTx::_active->_handleDisconnect();
+  }
+};
+
+VescBleRxTx::VescBleRxTx(){}
+
+void VescBleRxTx::_ensureBleInit(){
+  if (!s_bleInit){
+    BLEDevice::init("");
+    s_bleInit = true;
+  }
+}
+
+void VescBleRxTx::begin(){
+  _ensureBleInit();
+}
+
+void VescBleRxTx::disconnect(){
+  if (!_connected && !_connecting) return;
+  BLEClient* client = reinterpret_cast<BLEClient*>(_client);
+  if (client){ client->disconnect(); }
+  _handleDisconnect();
+}
+
+bool VescBleRxTx::_connectResolvedAddress(const char* macStr){
+  _ensureBleInit();
+  BLEAddress addr(macStr);
+  BLEClient* client = BLEDevice::createClient();
+  client->setClientCallbacks(new _ClientCB());
+  if (!client->connect(addr)) return false;
+  _client = client;
+  return _postConnectSetup();
+}
+
+bool VescBleRxTx::_postConnectSetup(){
+  BLEClient* client = reinterpret_cast<BLEClient*>(_client);
+  if (!client) return false;
+  BLERemoteService* svc = client->getService(BLEUUID(_uuidSvc.c_str()));
+  if (!svc) return false;
+  BLERemoteCharacteristic* rx = svc->getCharacteristic(BLEUUID(_uuidRx.c_str()));
+  BLERemoteCharacteristic* tx = svc->getCharacteristic(BLEUUID(_uuidTx.c_str()));
+  if (!rx || !tx) return false;
+  _rxChar = rx; _txChar = tx;
+  if (tx->canNotify()){
+    tx->registerForNotify([](BLERemoteCharacteristic* chr, uint8_t* data, size_t len, bool isNotify){
+      if (VescBleRxTx::_active) VescBleRxTx::_active->_handleNotify(data, len);
+    });
+  }
+  _connected = true;
+  _connecting = false;
+  _active = this;
+  if (_onConn) _onConn();
+  return true;
+}
+
+bool VescBleRxTx::connectByMac(const char* mac){
+  _targetMac = mac ? mac : "";
+  _targetName = "";
+  _connecting = true;
+  bool ok = _connectResolvedAddress(_targetMac.c_str());
+  _connecting = false;
+  if (!ok) _handleDisconnect();
+  return ok;
+}
+
+bool VescBleRxTx::connectByName(const char* name){
+  _ensureBleInit();
+  _targetName = name ? name : "";
+  _targetMac  = "";
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setActiveScan(true);
+  BLEScanResults results = scan->start(6, false);
+  String macFound;
+  for (int i = 0; i < results.getCount(); ++i){
+    BLEAdvertisedDevice d = results.getDevice(i);
+    if (d.haveName() && _targetName == d.getName().c_str()){
+      macFound = d.getAddress().toString().c_str();
+      break;
     }
-    return crc;
   }
+  scan->stop();
+  if (macFound.length() == 0) return false;
+  return connectByMac(macFound.c_str());
+}
 
-  static void write_i32_be(uint8_t* p, int32_t v) {
-    p[0] = (uint8_t)((v >> 24) & 0xFF);
-    p[1] = (uint8_t)((v >> 16) & 0xFF);
-    p[2] = (uint8_t)((v >> 8)  & 0xFF);
-    p[3] = (uint8_t)( v        & 0xFF);
+void VescBleRxTx::setNusUuids(const char* svc, const char* rx, const char* tx){
+  if (svc) _uuidSvc = svc;
+  if (rx)  _uuidRx  = rx;
+  if (tx)  _uuidTx  = tx;
+}
+
+void VescBleRxTx::setControlMode(int mode){ _mode = clampv(mode, 0, 3); }
+void VescBleRxTx::setCommand(float value){ _cmdUser = value; _lastCmdSetMs = millis(); }
+
+float VescBleRxTx::_applyDeadband(float v) const {
+  const float db = _deadbandPct;
+  if (fabsf(v) < db) return 0.0f;
+  return v;
+}
+float VescBleRxTx::_applyIir(float in){
+  _cmdFilt = _iirAlpha * in + (1.0f - _iirAlpha) * _cmdFilt;
+  return _cmdFilt;
+}
+float VescBleRxTx::_applySlew(float in, float dt_s){
+  const float maxDelta = _slewAperSec * dt_s;
+  float delta = in - _cmdFilt;
+  if (delta >  maxDelta) delta =  maxDelta;
+  if (delta < -maxDelta) delta = -maxDelta;
+  _cmdFilt += delta;
+  return _cmdFilt;
+}
+static inline int32_t float_to_be1000(float v){
+  long iv = lroundf(v * 1000.0f);
+  return (int32_t)iv;
+}
+int32_t VescBleRxTx::_encodeToBE1000(float v) const { return float_to_be1000(v); }
+
+void VescBleRxTx::loop(){
+  const uint32_t now = millis();
+  float cmd = _cmdUser;
+  switch (_mode){
+    case VESC_MODE_BRAKE: cmd = cmd < 0 ? 0 : cmd; break;
+    case VESC_MODE_DUTY:  cmd = clampv(cmd, -1.0f, 1.0f); break;
+    default: break;
   }
+  cmd = _applyDeadband(cmd);
+  _applyIir(cmd);
+  float dt = (now - _lastSendMs) * 0.001f; if (dt < 0) dt = 0;
+  _applySlew(_cmdFilt, dt);
 
-  static size_t vesc_build_packet(const uint8_t* payload, size_t len, uint8_t* out) {
-    size_t i = 0;
-    if (len <= 255) { out[i++] = 2; out[i++] = (uint8_t)len; }
-    else            { out[i++] = 3; out[i++] = (len >> 8) & 0xFF; out[i++] = len & 0xFF; }
-    memcpy(out + i, payload, len); i += len;
-    uint16_t crc = crc16_ccitt(payload, len);
-    out[i++] = (crc >> 8) & 0xFF;
-    out[i++] = (crc) & 0xFF;
-    out[i++] = 3;
-    return i;
+  if (_connected && (now - _lastSendMs >= _sendIntervalMs)){
+    float out = _cmdFilt;
+    if ((now - _lastCmdSetMs) > _idleZeroMs){
+      out = 0.0f; _cmdFilt = 0.0f;
+    }
+    BLERemoteCharacteristic* rx = reinterpret_cast<BLERemoteCharacteristic*>(_rxChar);
+    if (rx){
+      int32_t be = _encodeToBE1000(out);
+      uint8_t b[4] = {
+        uint8_t((be >> 24) & 0xFF),
+        uint8_t((be >> 16) & 0xFF),
+        uint8_t((be >>  8) & 0xFF),
+        uint8_t( be        & 0xFF)
+      };
+      rx->writeValue(b, 4, false);
+    }
+    _lastSendMs = now;
   }
+}
 
-  void set_writer(WriteFn fn) { s_writer = fn; }
-  bool is_ready() {
-    #ifdef VESCBLERXTX_ENABLE_NIMBLE
-      extern bool __vesc_tx_is_bound_nimble();
-      if (__vesc_tx_is_bound_nimble()) return true;
-    #endif
-    return (s_writer != nullptr);
+void VescBleRxTx::_handleNotify(uint8_t* data, size_t len){
+  if (_rawCb) _rawCb(data, len);
+  for (size_t i=0;i<len;i++){
+    char c = (char)data[i];
+    if (c == '\r') continue;
+    if (c == '\n'){
+      if (_lineLen > 0){ _parseTelemetryLine(_lineBuf, _lineLen); _lineLen = 0; }
+    } else {
+      if (_lineLen < _NL-1){ _lineBuf[_lineLen++] = c; _lineBuf[_lineLen] = 0; }
+    }
   }
+}
 
-  static bool send_framed(const uint8_t* payload, size_t len) {
-    uint8_t frame[128];
-    size_t n = vesc_build_packet(payload, len, frame);
-    #ifdef VESCBLERXTX_ENABLE_NIMBLE
-      extern bool __vesc_tx_write_nimble(const uint8_t* data, size_t len);
-      if (__vesc_tx_write_nimble(frame, n)) return true;
-    #endif
-    if (s_writer) return s_writer(frame, n);
-    return false;
+static bool parse_keyval(const char* s, String& key, float& val){
+  const char* eq = strchr(s, '=');
+  if (!eq) return false;
+  key = String();
+  const char* p = s;
+  while (*p && *p <= ' ') p++;
+  const char* q = eq-1;
+  while (q>p && *q <= ' ') q--;
+  key.reserve(q-p+1);
+  for (const char* k=p; k<=q; ++k) key += *k;
+  val = atof(eq+1);
+  return true;
+}
+
+void VescBleRxTx::_parseTelemetryLine(const char* line, size_t len){
+  if (!_telCb) return;
+  VescTelemetry t{}; t.millisStamp = millis();
+  String token;
+  for (size_t i=0;i<=len;i++){
+    char c = (i<len) ? line[i] : ',';
+    if (c==',' || c==';'){
+      if (token.length()){
+        String key; float v=NAN;
+        if (parse_keyval(token.c_str(), key, v)){
+          if      (key=="volt"||key=="voltage")         t.voltage = v;
+          else if (key=="erpm"||key=="rpm")             t.erpm = v;
+          else if (key=="duty")                         t.duty = v;
+          else if (key=="ain" ||key=="avginputcurrent") t.avgInputCurrent = v;
+          else if (key=="amot"||key=="avgmotorcurrent") t.avgMotorCurrent = v;
+          else if (key=="tmos"||key=="tempmosfet")      t.tempMosfet = v;
+          else if (key=="tmot"||key=="tempmotor")       t.tempMotor = v;
+          else if (key=="cur_in"||key=="inputcurrent")  t.current_in = v;
+          else if (key=="cur_mot"||key=="motorcurrent") t.current_motor = v;
+          else if (key=="wh"||key=="watthours")         t.watt_hours = v;
+          else if (key=="wh_chg"||key=="charged")       t.watt_hours_charged = v;
+          else if (key=="ah"||key=="amphours")          t.amp_hours = v;
+          else if (key=="ah_chg"||key=="amphourscharged") t.amp_hours_charged = v;
+          else if (key=="speed"||key=="kmh")            t.speed_kmh = v;
+          else if (key=="pos"||key=="position")         t.position = v;
+          else if (key=="tacho"||key=="tachometer")     t.tachometer = (int32_t)v;
+          else if (key=="tacho_abs")                    t.tachometer_abs = (int32_t)v;
+          else if (key=="tmp1"||key=="tempmos1")        t.temp_mos_1 = v;
+          else if (key=="tmp2"||key=="tempmos2")        t.temp_mos_2 = v;
+          else if (key=="tmp3"||key=="tempmos3")        t.temp_mos_3 = v;
+          else if (key=="tmp_pcb"||key=="temppcb")      t.temp_pcb = v;
+          else if (key=="batt"||key=="battery")         t.battery_level = v;
+          else if (key=="batt_wh"||key=="batterywh")    t.battery_wh = v;
+          else if (key=="fault"||key=="faultcode")      t.fault_code = (uint8_t)v;
+          else if (key=="ctrl_id"||key=="controllerid") t.controller_id = (uint8_t)v;
+          else if (key=="pid_pos"||key=="pidposition")  t.pid_pos = v;
+        }
+        token = String();
+      }
+    } else { token += c; }
   }
+  _telCb(t);
+}
 
-  bool send_packet(const uint8_t* payload, size_t len) { return send_framed(payload, len); }
-
-  bool set_current(float amps) { // scale 1000
-    int32_t q = (int32_t)lroundf(amps * 1000.0f);
-    uint8_t p[1 + 4]; p[0] = 6; write_i32_be(&p[1], q);
-    return send_framed(p, sizeof(p));
-  }
-  bool set_brake(float amps) { // scale 1000
-    if (amps < 0) amps = -amps;
-    int32_t q = (int32_t)lroundf(amps * 1000.0f);
-    uint8_t p[1 + 4]; p[0] = 7; write_i32_be(&p[1], q);
-    return send_framed(p, sizeof(p));
-  }
-  bool set_rpm(int rpm) { // scale 1
-    uint8_t p[1 + 4]; p[0] = 8; write_i32_be(&p[1], rpm);
-    return send_framed(p, sizeof(p));
-  }
-
-} // namespace
-
-#ifdef VESCBLERXTX_ENABLE_NIMBLE
-  #include <NimBLEDevice.h>
-  namespace vescblerxtx { static NimBLERemoteCharacteristic* s_tx = nullptr; void set_tx(NimBLERemoteCharacteristic* tx){ s_tx = tx; } }
-  bool __vesc_tx_is_bound_nimble() { using namespace vescblerxtx; extern NimBLERemoteCharacteristic* s_tx; return s_tx != nullptr; }
-  bool __vesc_tx_write_nimble(const uint8_t* data, size_t len) { using namespace vescblerxtx; extern NimBLERemoteCharacteristic* s_tx; if(!s_tx) return false; return s_tx->writeValue((uint8_t*)data, len, false); }
-#endif
+void VescBleRxTx::_handleDisconnect(){
+  _connected = false; _connecting = false;
+  _client = nullptr; _rxChar = nullptr; _txChar = nullptr;
+  if (_onDisc) _onDisc();
+}
